@@ -5,3 +5,7 @@ __pycache__/
 unsloth_compiled_cache/
 /.claude
 /.codex
+/.venv/
+/runs/
+/.pytest_cache/
+*.egg-info/

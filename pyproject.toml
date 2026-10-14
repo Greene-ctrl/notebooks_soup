@@ -1,25 +1,35 @@
 [project]
 name = "notebooks"
 version = "0.1.0"
-description = "Add your description here"
+description = "Unsloth notebook references and the Training Master execution runner"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "ipykernel>=6.30.1",
     "ipywidgets>=8.1.7",
     "nbconvert>=7.16.6",
+    "pydantic>=2,<3",
+    "pyyaml>=6",
 ]
+
+[project.optional-dependencies]
+hub = ["huggingface-hub>=0.34,<3"]
+test = ["pytest>=8", "pyspellchecker", "tqdm", "huggingface-hub>=0.34,<3"]
+
+[project.scripts]
+training-master = "training_master.runner:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 
-# Explicit setuptools package discovery. Without this, the flat layout (with
-# top-level scripts/, tests/ directories) makes setuptools try to
-# auto-discover them all as packages, which fails the `pip install -e .`
-# invocation. This project ships no
-# importable Python package -- generator helpers live as flat modules under
-# scripts/ and are imported via sys.path.insert at runtime by the tests.
+# Keep upstream generator scripts as flat modules; package only the runner.
 [tool.setuptools]
-packages = []
 py-modules = []
+
+[tool.setuptools.packages.find]
+include = ["training_master*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
