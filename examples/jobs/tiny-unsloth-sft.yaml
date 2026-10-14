@@ -1,0 +1,31 @@
+version: 1
+run_id: tiny-unsloth-sft-001
+model:
+  id: Qwen/Qwen3-0.6B
+dataset:
+  source: Salesforce/wikitext
+  config: wikitext-2-raw-v1
+  split: train
+  format: plaintext
+  limit: 8
+task:
+  type: sft
+engine:
+  type: unsloth
+training:
+  epochs: 1
+  max_steps: 4
+  batch_size: 1
+  max_length: 128
+  quantization: 4bit
+  lora:
+    enabled: true
+    r: 8
+    alpha: 16
+artifacts:
+  hf_repo: null
+  checkpoint_interval: 2
+requirements:
+  min_vram_gb: 4
+resume:
+  mode: auto

@@ -37,6 +37,10 @@ on:
       - 'scripts/**'
       - 'tests/**'
       - 'pyproject.toml'
+      - 'uv.lock'
+      - 'training_master/**'
+      - 'examples/**'
+      - 'TRAINING_MASTER.md'
       - 'README.md'
       - '.github/workflows/notebooks-tests-ci.yml'
   push:
@@ -83,8 +87,11 @@ jobs:
           # nbconvert silently falls back to commenting out the raw
           # magic syntax and the regen-parity diff fires false-positive
           # on every notebook that uses a cell magic.
-          pip install pytest pyyaml nbformat nbconvert ipython \
+          pip install pytest pyyaml 'pydantic>=2,<3' nbformat nbconvert ipython \
             pyspellchecker tqdm huggingface_hub
+
+      - name: Training Master CPU contracts
+        run: python -m pytest tests/test_training_master.py -q --tb=short
 
       - name: tests/test_notebook_json_validity.py
         run: |

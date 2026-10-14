@@ -1,3 +1,9 @@
+This fork adds **[Training Master](TRAINING_MASTER.md)**, a portable JobSpec runner
+with Soup as the generic default, direct Unsloth SFT, and an opt-in NeMo AutoModel
+boundary. Start with [Colab](nb/Training_Master_Colab.ipynb) or
+[Kaggle](nb/Kaggle-Training_Master.ipynb). The upstream model-specific collection,
+licensing, and attribution below remain preserved.
+
 <div align="center">
 
   <a href="https://unsloth.ai"><picture>

@@ -1586,7 +1586,10 @@ KNOWN_TYPES_ORDERED = [
 
 # Notebooks excluded from automated updates. Each entry is preserved
 # exactly as the author wrote it (custom install cells, bespoke content, etc.).
+TRAINING_MASTER_NOTEBOOKS = {"Training_Master_Colab.ipynb", "Kaggle-Training_Master.ipynb"}
+
 DONT_UPDATE_EXCEPTIONS = [
+    *sorted(TRAINING_MASTER_NOTEBOOKS),  # Generic bootloaders have their own short source cells.
     "Falcon_H1-Alpaca.ipynb",                                         # Custom Falcon H1 hybrid architecture setup
     "Liquid_LFM2-Conversational.ipynb",                                # Custom Liquid Foundation Model install
     "Advanced_Llama3_1_(3B)_GRPO_LoRA.ipynb",                          # Hand-tuned advanced GRPO notebook
@@ -1607,12 +1610,14 @@ DONT_UPDATE_EXCEPTIONS = [
 # `lmsysorg/sglang:v0.5.16-rocm*` image or a `setup_rocm.py` compile, neither
 # of which fits in an install cell. `Unsloth_Studio` uses Studio's Colab-only launcher.
 AMD_SKIP_NOTEBOOKS = [
+    *sorted(TRAINING_MASTER_NOTEBOOKS),
     "Gemma3N_(2B)-Inference.ipynb",
     "Unsloth_Studio.ipynb",
 ]
 
 # No Kaggle counterpart: Studio's launcher is Colab-only.
 KAGGLE_SKIP_NOTEBOOKS = [
+    *sorted(TRAINING_MASTER_NOTEBOOKS),
     "Unsloth_Studio.ipynb",
 ]
 
@@ -4755,6 +4760,8 @@ def notebook_created_at_key(notebook_path, refs_by_nb, cache, assigned_by_nb=Non
 
 def _update_news_only(notebook_path, new_announcement):
     """Update ONLY the '### News' section in a notebook, leaving everything else untouched."""
+    if os.path.basename(notebook_path) in TRAINING_MASTER_NOTEBOOKS:
+        return False
     try:
         with open(notebook_path, "r", encoding="utf-8", newline="") as f:
             notebook_content = json.load(f)
@@ -4790,6 +4797,8 @@ def update_notebook_sections(
     installation_steps_kaggle,
     new_announcement,
 ):
+    if os.path.basename(notebook_path) in TRAINING_MASTER_NOTEBOOKS:
+        return
     try:
         with open(notebook_path, "r", encoding="utf-8", newline="") as f:
             notebook_content = json.load(f)
@@ -5823,6 +5832,8 @@ def add_colab_badge(notebooks_dir):
     paths = [x.replace("\\", "/") for x in paths]
 
     for path in paths:
+        if os.path.basename(path) in TRAINING_MASTER_NOTEBOOKS:
+            continue
         is_kaggle = is_path_contains_any(path.lower(), ["kaggle"])
         is_colab = not is_kaggle
         if is_colab:
@@ -5856,6 +5867,9 @@ def update_readme(
 
     paths = glob(os.path.join(notebooks_dir, "*.ipynb"))
     paths = [x.replace("\\", "/") for x in paths]
+
+    # Fork-specific entrypoints are linked separately, not in upstream model tables.
+    paths = [x for x in paths if os.path.basename(x) not in TRAINING_MASTER_NOTEBOOKS]
 
     # Scan notebooks for HF model refs and refresh the model_created_at cache
     # so we can sort rows by the most recently created referenced model.
@@ -6891,6 +6905,8 @@ def _ensure_memory_stats_hidden(nb_path):
 
 
 def _apply_global_fixes(nb_path):
+    if os.path.basename(nb_path) in TRAINING_MASTER_NOTEBOOKS:
+        return
     try:
         with open(nb_path, "r", encoding="utf-8", newline="") as f:
             raw = f.read()

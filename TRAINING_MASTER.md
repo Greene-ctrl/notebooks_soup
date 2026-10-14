@@ -1,0 +1,347 @@
+# Training Master execution repository
+
+This fork keeps the upstream Unsloth notebook collection as model-specific reference
+material. Its new entrypoints are **[Colab](nb/Training_Master_Colab.ipynb)** and
+**[Kaggle](nb/Kaggle-Training_Master.ipynb)**. They run the same JobSpec. The existing
+OpenOperator / Agent Zero → Training Master → BackendResolver control plane remains
+separate; this repository owns execution, not scheduling or job issuance.
+
+```text
+backend-neutral JobSpec
+  → platform + hardware + runtime secret providers
+  → engine resolver → Soup | direct Unsloth | opt-in NeMo boundary
+  → complete checkpoint restore → training → checkpoint/artifact hooks
+```
+
+Colab and Kaggle are disposable compute. Their notebook survives; their disk and
+processes may not. `runs/` is a cache and staging area, never authoritative state.
+HF Hub is the optional durable model-repository adapter. A run without explicit
+publication has **no durable recovery guarantee**. DGX Spark uses the same local
+runner in its already configured environment; this implementation does not change
+its system stack or launch containers.
+
+## Install and first smoke run
+
+Notebook maintenance retains the repository's `.python-version` (3.13) and `uv.lock`.
+**Soup execution requires Python 3.10–3.12**, per its current metadata. Use a separate
+Python 3.12 runtime/venv rather than bypassing its Python bound. The runner itself
+supports Python >=3.10. Example local installation, from this checkout:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install 'pydantic>=2,<3' 'pyyaml>=6'
+python -m pip install --no-deps -e .
+```
+
+First inspect a CPU-safe plan without installing ML frameworks or fetching weights:
+
+```bash
+python -m training_master.runner examples/jobs/tiny-soup-sft.yaml \
+  --plan --hardware-profile examples/hardware/t4.json --output-dir /tmp/training-master-plan
+```
+
+The profile is **illustrative**, not evidence of hardware availability. The CLI
+refuses `--execute` with `--plan` or `--hardware-profile`. A successful plan validates
+translation and requirements only, not a training installation or model fit.
+
+For the first actual tiny training run, in a **CUDA GPU Python 3.12 runtime**:
+
+```bash
+python -c 'from training_master import load_job; from training_master.bootstrap import bootstrap; bootstrap(load_job("examples/jobs/tiny-soup-sft.yaml"), training=True)'
+python -m training_master.runner examples/jobs/tiny-soup-sft.yaml --cli-preflight
+python -m training_master.runner examples/jobs/tiny-soup-sft.yaml --execute
+```
+
+This uses public `HuggingFaceTB/SmolLM2-135M`, streams eight nonempty Wikitext rows,
+sequence length 128, LoRA rank 8, batch size 1, accumulation 1, one epoch. It has at
+most eight optimizer steps. It proves wiring, not model quality. Uploads default to
+off. `tiny-unsloth-sft.yaml` uses public `Qwen/Qwen3-0.6B`, four steps, and QLoRA.
+Use a new `run_id` for each independent experiment.
+
+In a notebook, pip may replace a framework already imported for hardware probing.
+The bootstrap detects changed installed versions and requires a kernel restart;
+rerun the cells after restarting. It never continues with stale imported wheels.
+
+## JobSpec v1
+
+`training_master.job.JobSpec` uses Pydantic 2, rejects unknown keys at every level,
+and accepts dict injection, local YAML/JSON, HTTPS JobSpec URLs, or
+`hf://owner/repository/path/to/job.yaml` from a model repository. HTTP, credentials
+in URL userinfo, query strings, and fragments are refused for URL JobSpecs. There
+are no executable remote Python/config hooks. `TRAINING_MASTER_TOKEN` is restored
+for future control-plane integration; no remote control-plane protocol is invented.
+
+```yaml
+version: 1
+run_id: smoke-qwen-001
+model:
+  id: Qwen/Qwen3-0.6B
+  revision: main
+dataset:
+  source: Salesforce/wikitext
+  config: wikitext-2-raw-v1
+  split: train
+  format: plaintext
+  text_field: text
+  limit: 8
+task:
+  type: sft
+engine:
+  type: auto
+  backend: transformers
+training:
+  epochs: 1
+  batch_size: 1
+  max_length: 128
+  quantization: none
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  learning_rate: 0.0002
+  seed: 42
+  lora:
+    enabled: true
+    r: 8
+    alpha: 16
+    dropout: 0
+    target_modules: [q_proj, v_proj]
+artifacts:
+  hf_repo: null
+  checkpoint_interval: 2
+requirements:
+  min_vram_gb: 4
+resume:
+  mode: auto
+```
+
+The spec contains no backend paths, device IDs, platform install choices, or secrets.
+`engine.backend` is optional and applies only to Soup (default `transformers`);
+an explicit backend setting is rejected by direct Unsloth rather than ignored.
+Execution paths/hardware/engine choice are recorded separately in `resolved.json`.
+The minimum VRAM requirement checks the first visible GPU; two T4s do not become
+one 30 GB device. `batch_size: auto` is passed to Soup's current implementation and
+resolves conservatively to **1** in the direct Unsloth engine. RAM/disk readings and
+a VRAM floor are not a model-size estimator; Soup performs its own preflight.
+
+Both runnable adapters initially support **text causal-LM SFT with LoRA/QLoRA**.
+Other tasks can be expressed in v1 but produce a clear unsupported-task error.
+Dataset formats are `plaintext`, `alpaca`, and text-only `chatml`. HF datasets are
+streamed using the requested config/split; the optional row limit counts nonempty
+rows. Local input is JSONL, resolved relative to the caller's current directory;
+local config/split overrides are rejected. Both engines receive the same normalized
+rows. Direct Unsloth uses the model's chat template for alpaca/chatml. Soup uses its
+own supported formatting. Their numerical outputs and tokenization are not promised
+to be identical.
+
+## Engine policy and upstream contracts
+
+Explicit engine requests either work as requested or fail. `auto` considers a
+supported, installed NeMo adapter for Nemotron first, then Soup, then direct
+Unsloth. It never changes the task or drops a requested field. Offline `--plan`
+allows a supported adapter whose dependencies are absent and labels the result as
+planning only. An explicit engine can be bootstrapped without installing alternatives.
+
+| Use case | Preferred engine |
+|---|---|
+| Generic SFT/LoRA | Soup |
+| Kaggle/Colab QLoRA | Soup (`backend: transformers` or `unsloth`) |
+| Model-specific Unsloth optimization | Direct Unsloth / preserved reference notebook |
+| Nemotron model-specific tuning | NeMo AutoModel, provisioned and validated separately |
+| Unsupported/custom experiment | Explicit custom path later |
+
+### Soup
+
+Inspected `MakazhanAlpamys/Soup` commit
+`d5cb1a7e87a0042de27b83947f6948c3ca9456b7` (version **0.76.0**):
+`examples/README.md`, SFT/DPO/GRPO/RLHF examples, config schema and loader,
+backend support, install extras, doctor/train/data/adapters commands, and SFT
+checkpoint/output behavior. Bootstrap pins that Git commit instead of inventing a
+Python training API. Lightweight `soup-cli` is separate from its `[train]` extra;
+`backend: unsloth` adds `[fast]` only for actual selected-engine installation.
+
+Verified command contracts:
+
+```bash
+soup doctor --config runs/RUN_ID/soup.yaml
+soup train --config runs/RUN_ID/soup.yaml --dry-run
+soup train --config runs/RUN_ID/soup.yaml --yes
+soup train --config runs/RUN_ID/soup.yaml --yes --resume PATH
+soup data inspect PATH
+soup adapters check PATH --json
+```
+
+The adapter emits only supported fields: `base`, `task`, `backend`, `data.train`,
+`data.format`, `data.max_length`, `data.val_split`, the mapped training/LoRA settings,
+and `output`. Both doctor and train's data dry run must succeed before execution.
+Their output and exit statuses are preserved in `logs/soup.log`. The offline dry-run
+path performs JobSpec/config translation without downloading data or weights;
+`--cli-preflight` additionally fetches the small selected dataset and may fetch model
+configuration, but does not instantiate/download model weights.
+
+**There is no `training.max_steps` in this Soup schema/CLI.** An explicit Soup job
+requesting it fails; an auto job can resolve to direct Unsloth if supported. Soup's
+smoke uses a bounded dataset and epochs. Do not assume it implements a strict step
+limit. `model.revision` other than `main` is also refused by this Soup adapter because
+there is no corresponding upstream config field. Exact upstream model/data revision
+pinning is therefore a current limitation for Soup.
+
+`training.stream_layers` is only emitted for transformers SFT, quantization `none`,
+batch size 1, accumulation 1. Soup's own preflight still checks architecture, RAM,
+disk and model compatibility. It is not an Unsloth streaming option.
+
+### Direct Unsloth
+
+`FastLanguageModel`, `get_peft_model`, `SFTTrainer/SFTConfig`, adapter/tokenizer saving,
+and Trainer resume follow the upstream Qwen SFT references. Imports load Unsloth
+before TRL/Transformers. The bootstrap pins Unsloth/Unsloth Zoo **2026.10.5**,
+TRL **0.22.2**, Transformers **4.57.6**, and their tokenizer window. Dependency
+metadata resolution was checked; no GPU import/training success is claimed. It
+preserves an installed torch version to let pip choose compatible kernels instead
+of resolving blindly to a CUDA 13 wheel; without torch it requests 2.10.0.
+Unsloth bootstrap requires torch >=2.8 and pins torchao 0.16.0 below torch 2.11,
+or 0.18.0 on newer torch, because torchao's dependency metadata omits that
+compatibility relationship. Soup's transformers backend allows torch >=2.6. Actual
+CUDA driver, wheel and hardware compatibility must pass on the target runtime.
+
+Supports LoRA/4-bit QLoRA, `max_steps`, seed, sequence length, checkpoints and
+same-engine Trainer resume. No DPO/GRPO/distillation, vision/audio, distributed
+launcher, merged model/GGUF export or notebook-specific model overrides are added.
+Use the preserved upstream notebooks for those reference paths.
+
+### NeMo AutoModel boundary
+
+Inspected `NVIDIA-NeMo/Nemotron` commit
+`ca8c409f08a9a5a5648d427383adea741b61966a`: steps overview, AutoModel SFT/PEFT
+readmes/configs, shared recipe runner, hardware guidance and current AutoModel
+cookbook notebooks. Upstream steps consume chat JSONL and produce HF/LoRA
+checkpoints. Their "tiny" configuration can still require two nodes × eight GPUs;
+it is not a small Kaggle recipe.
+
+`NemoAutoModelEngine` detects `nemo_automodel` and reports a conservative CUDA/bf16/
+VRAM candidate hint. **Recipe translation and execution are not implemented.** Its
+`supports` returns false, so auto cannot select a detection-only adapter as a working
+engine. The resolver's preference order is ready for a future executable adapter.
+A candidate hint is not a claim a large Nemotron model fits. No NVIDIA stack,
+Megatron, or NeMo-RL is installed by default; no NVIDIA implementation code is copied.
+
+## Colab and Kaggle bootloaders
+
+Both notebooks share the same small code cells and default JobSpec. Set
+`TRAINING_MASTER_REF` to a **published immutable fork commit SHA**. The notebook
+checks out that commit; it cannot fetch this local unpublished branch yet.
+`TRAINING_MASTER_CHECKOUT` can select an existing checkout for local development.
+Source bootstrap installs only Pydantic/PyYAML. Heavy dependencies are selected after
+job/hardware inspection, only with `RUN_TRAINING=True`.
+
+Colab detects its runtime environment, uses `/content/runs`, and prefers
+`google.colab.userdata.get`. Add `HF_TOKEN`, optionally `WANDB_API_KEY` and
+`TRAINING_MASTER_TOKEN` to Secrets and grant notebook access. The runner does not
+print secret values or call a login that saves them to tracked files.
+
+Kaggle detects its runtime environment, uses `/kaggle/working/runs`, and prefers
+`kaggle_secrets.UserSecretsClient().get_secret`. Attach those names in notebook
+Secrets and enable Internet/GPU as needed for installation and model/dataset reads.
+Both providers fall back to environment variables. W&B and control-plane tokens
+are restored for integrations; W&B logging is intentionally disabled in initial SFT.
+
+The notebooks default to `RUN_TRAINING=False` and `PUBLISH_ARTIFACTS=False`. Set the
+first to true to execute; set an existing `artifacts.hf_repo` and the second to true
+only when you authorize Hub uploads. Choose a Python 3.12 runtime for Soup. If the
+host offers a different interpreter, use its supported runtime selection rather
+than ignoring Soup's version requirements.
+
+## Artifact and checkpoint contract
+
+```text
+runs/<run_id>/
+  job.yaml
+  resolved.json
+  hardware.json
+  status.json
+  soup.yaml                 # Soup adapter only
+  data.jsonl                # normalized selected rows, created for execution
+  logs/
+  checkpoints/trainer/checkpoint-N/
+  metrics/
+  final/
+```
+
+HF uses `runs/<run_id>/checkpoints/checkpoint-N/` and the remaining run metadata,
+metrics and final artifacts under `runs/<run_id>/`. The runner uses an **existing
+model repo** and does not silently create repositories. Normalized dataset rows
+are staged locally and excluded from run uploads.
+Soup exposes metrics through logs and saved Trainer checkpoint state; the runner
+copies the latest available state into `metrics/` and records whether it is partial
+in `availability.json`. Without a checkpoint/final Trainer-state file, only the CLI
+log is available. Direct Unsloth additionally writes its final training metrics.
+HF authentication comes from the
+secret provider. Reads/restoration are possible when `hf_repo` is set; writes require
+`execute(publish=True)` or CLI `--execute --publish`. No test requires live Hub writes.
+
+`find_latest_checkpoint`, `restore_checkpoint`, and `publish_checkpoint` require a
+completion manifest, job fingerprint, engine identity, numeric step and SHA-256
+file hashes. Adapter weights alone are insufficient: Trainer state, optimizer,
+scheduler, RNG and weights must be present. Partial uploads, corrupted checkpoints,
+other jobs, and other engines are ignored for automatic selection. `resume: required`
+fails if no valid compatible checkpoint is found; `never` skips restoration.
+
+Unsloth seals checkpoints in Trainer's `on_save`. Soup CLI checkpoints are monitored
+until their completed Trainer state is present, then sealed/uploaded; process exits
+also trigger a scan. Each Hub upload commits files and manifest together. A runtime
+may still vanish **before** a save/upload completes; only a successfully published
+checkpoint can be durable. Upload failures stop execution and leave a safe failed
+status and local recovery files. Hugging Face commits are immutable, but restoring
+larger checkpoints costs network/disk time. Complete Trainer checkpoints can still
+be incompatible across library versions or hardware layouts; no multi-node/sharded
+checkpoint conversion is provided.
+
+Contract tests simulate restoration on another platform. **Real Kaggle → Colab GPU
+resume has not been tested and is not claimed.** Use the same run ID, job and engine;
+changing the engine is a new run. Model weights/optimizer state from checkpoints
+must be trusted because Trainer resume loads framework checkpoint formats.
+
+## Development, tests and notebook synchronization
+
+```bash
+uv sync --frozen --extra test
+uv run --extra test python -m pytest tests/test_training_master.py -q
+uv run --extra test python scripts/build_training_master_notebooks.py
+```
+
+The builder writes only the two canonical notebooks and uses the existing
+`convert_notebook_to_script` for their Python mirrors. They are excluded from model
+announcement/install mutations and AMD/Kaggle variant generation. The fork links
+sit outside generated upstream README tables. Other notebook content and license
+notices are left untouched. CPU tests cover JobSpec validation, providers, structured
+hardware, resolver/fallback policy, supported/unsupported Soup fields, paths, dataset
+selection, checkpoint integrity, artifact hooks, safe statuses and notebook parity.
+A fixture engine exercises orchestration without training a model.
+
+The inherited CPU suite has existing failures in Qwen Tool Use/Tool Calling
+consistency/pin detectors and generated-script mirrors. New work does not regenerate
+or suppress those failures. The heavyweight ML API-drift matrix was excluded from
+the CPU run; existing image URL checks were included.
+
+Validation for this change (baseline `31a8d597f678f54ea343368713d8db880af008a7`):
+
+- Full CPU run: **15,410 passed, 569 skipped, 18 failed** with
+  `python -m pytest tests --ignore=tests/test_notebook_api_drift.py -q --tb=short -p no:cacheprovider`.
+  The 18 failing test IDs exactly match the pre-change baseline; they concern
+  inherited Qwen generated-source parity and vLLM pin/selector detectors.
+- Final runner contracts: **67 passed** on Python 3.13 and **67 passed** on Python 3.12.
+- Both new notebooks validate as nbformat 4 JSON and match their generated scripts.
+- The packaged CLI planning pipeline and generated YAML were checked against the
+  actual Soup 0.76.0 config loader, doctor and current CLI help contracts.
+- Dependency metadata resolution, lockfile consistency, runner Ruff checks and
+  the repository's dynamic-execution gate passed.
+- No GPU model load/training, real Colab/Kaggle launch, real cross-backend resume,
+  or Hub upload was performed. The separate ML API-drift matrix was not run.
+
+## Licensing and scope
+
+Upstream notices and `LICENSE` remain intact. These new notebooks use
+LGPL-3.0-or-later and acknowledge upstream Unsloth reference material. The Soup
+adapter interoperates with its Apache-2.0 CLI/config contract rather than copying
+its internal trainers. NVIDIA recipe references are attributed above; no recipes
+are copied. This change does not push a branch, open a PR, train on paid GPU quota,
+or upload artifacts automatically.

@@ -1,0 +1,33 @@
+version: 1
+run_id: tiny-soup-sft-001
+model:
+  id: HuggingFaceTB/SmolLM2-135M
+# Public text dataset, streamed and capped; at most 8 optimizer steps in one
+# epoch with batch size 1 and accumulation 1. Soup has no max_steps setting.
+dataset:
+  source: Salesforce/wikitext
+  config: wikitext-2-raw-v1
+  split: train
+  format: plaintext
+  limit: 8
+task:
+  type: sft
+engine:
+  type: auto
+  backend: transformers
+training:
+  epochs: 1
+  batch_size: 1
+  max_length: 128
+  quantization: none
+  lora:
+    enabled: true
+    r: 8
+    alpha: 16
+artifacts:
+  hf_repo: null
+  checkpoint_interval: 2
+requirements:
+  min_vram_gb: 1
+resume:
+  mode: auto
