@@ -3,6 +3,8 @@ with Soup as the generic default, direct Unsloth SFT, and an opt-in NeMo AutoMod
 boundary. Start with [Colab](nb/Training_Master_Colab.ipynb) or
 [Kaggle](nb/Kaggle-Training_Master.ipynb). The upstream model-specific collection,
 licensing, and attribution below remain preserved.
+For CPU-compatible prompt optimization, use [DSPy GEPA](nb/Prompt_Optimization_GEPA.ipynb)
+with independently configured student and reflection APIs; see [the workflow guide](TRAINING_MASTER.md#prompt-optimization-with-dspy-gepa).
 
 <div align="center">
 

@@ -1586,7 +1586,7 @@ KNOWN_TYPES_ORDERED = [
 
 # Notebooks excluded from automated updates. Each entry is preserved
 # exactly as the author wrote it (custom install cells, bespoke content, etc.).
-TRAINING_MASTER_NOTEBOOKS = {"Training_Master_Colab.ipynb", "Kaggle-Training_Master.ipynb"}
+TRAINING_MASTER_NOTEBOOKS = {"Training_Master_Colab.ipynb", "Kaggle-Training_Master.ipynb", "Prompt_Optimization_GEPA.ipynb"}
 
 DONT_UPDATE_EXCEPTIONS = [
     *sorted(TRAINING_MASTER_NOTEBOOKS),  # Generic bootloaders have their own short source cells.

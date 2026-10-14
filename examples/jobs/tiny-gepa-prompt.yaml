@@ -1,0 +1,69 @@
+# Synthetic arithmetic; orchestration smoke only. No provider calls until --execute.
+version: 1
+kind: prompt_optimization
+run_id: tiny-gepa-prompt-001
+program:
+  type: predict
+  signature: question -> answer
+student:
+  model: openai/gpt-4.1-mini
+  api_base: null
+  api_key_secret: STUDENT_API_KEY
+  temperature: 0
+  max_tokens: 128
+reflection:
+  model: openai/gpt-4.1-mini
+  api_base: null
+  api_key_secret: REFLECTION_API_KEY
+  temperature: 1
+  max_tokens: 768
+optimizer:
+  type: gepa
+  max_metric_calls: 16
+  num_threads: 1
+  track_stats: true
+dataset:
+  train:
+  - question: What is 1 plus 1? Reply with only the integer.
+    answer: '2'
+  - question: What is 1 plus 2? Reply with only the integer.
+    answer: '3'
+  - question: What is 2 plus 2? Reply with only the integer.
+    answer: '4'
+  - question: What is 2 plus 3? Reply with only the integer.
+    answer: '5'
+  - question: What is 3 plus 3? Reply with only the integer.
+    answer: '6'
+  - question: What is 3 plus 4? Reply with only the integer.
+    answer: '7'
+  - question: What is 4 plus 4? Reply with only the integer.
+    answer: '8'
+  - question: What is 4 plus 5? Reply with only the integer.
+    answer: '9'
+  - question: What is 5 plus 5? Reply with only the integer.
+    answer: '10'
+  - question: What is 5 plus 6? Reply with only the integer.
+    answer: '11'
+  validation:
+  - question: What is 6 plus 6? Reply with only the integer.
+    answer: '12'
+  - question: What is 6 plus 7? Reply with only the integer.
+    answer: '13'
+  - question: What is 7 plus 7? Reply with only the integer.
+    answer: '14'
+  - question: What is 7 plus 8? Reply with only the integer.
+    answer: '15'
+  test:
+  - question: What is 8 plus 8? Reply with only the integer.
+    answer: '16'
+  - question: What is 8 plus 9? Reply with only the integer.
+    answer: '17'
+  - question: What is 9 plus 9? Reply with only the integer.
+    answer: '18'
+  - question: What is 9 plus 10? Reply with only the integer.
+    answer: '19'
+metric:
+  type: exact_match_with_feedback
+artifacts:
+  hf_repo: null
+  publish: false

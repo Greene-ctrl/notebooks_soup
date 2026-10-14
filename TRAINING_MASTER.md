@@ -9,8 +9,11 @@ separate; this repository owns execution, not scheduling or job issuance.
 ```text
 backend-neutral JobSpec
   → platform + hardware + runtime secret providers
-  → engine resolver → Soup | direct Unsloth | opt-in NeMo boundary
-  → complete checkpoint restore → training → checkpoint/artifact hooks
+  → kind=model_training → TrainingEngine → Soup | Unsloth | opt-in NeMo boundary
+      → complete checkpoint restore → training → checkpoint/artifact hooks
+  → kind=prompt_optimization → OptimizerEngine → DSPy GEPA
+      → baseline validation → compile(train, validation) → held-out evaluation
+      → portable JSON programs + metrics/statistics + optional artifact hooks
 ```
 
 Colab and Kaggle are disposable compute. Their notebook survives; their disk and
@@ -345,3 +348,299 @@ adapter interoperates with its Apache-2.0 CLI/config contract rather than copyin
 its internal trainers. NVIDIA recipe references are attributed above; no recipes
 are copied. This change does not push a branch, open a PR, train on paid GPU quota,
 or upload artifacts automatically.
+
+## Prompt optimization with DSPy GEPA
+
+Prompt optimization is a first-class workflow, separate from model training. GEPA
+implements `OptimizerEngine`; it does **not** subclass `TrainingEngine`, use Soup,
+or require LoRA, CUDA or a locally loaded model. The same prompt JobSpec can run
+on Colab CPU, Kaggle CPU, or a local/persistent machine using remote LMs.
+
+| Workflow | Engine |
+|---|---|
+| SFT/LoRA | Soup |
+| Optimized Unsloth training | Direct Unsloth |
+| Nemotron-specific training | NeMo AutoModel boundary / separately validated NVIDIA recipe |
+| Prompt optimization | DSPy GEPA |
+
+### Current API verified
+
+The adapter pins **DSPy 3.4.1**, whose GEPA dependency is **`gepa[dspy]==0.1.4`**.
+Verified the installed release's `dspy.GEPA`, `compile`, `dspy.LM`, `Prediction`,
+`Module.save/load`, program registry constructors, and `DspyGEPAResult.to_dict`.
+The official getting-started documentation was inspected in the DSPy source at
+`stanfordnlp/dspy` commit `1af633fecbb2b8acec7e3ed9acd6db1cde6d341c`, alongside
+`docs/docs/getting-started/gepa-optimization.md`, the GEPA adapter and its tests.
+The public `dspy.ai` URL was blocked by the cloud proxy; the release source and
+installed API were checked directly instead of relying on remembered APIs.
+
+The verified API accepts:
+
+```python
+optimizer = dspy.GEPA(
+    metric=metric, reflection_lm=reflection_lm,
+    max_metric_calls=16,  # OR auto="light"/"medium"/"heavy", never both
+    num_threads=1, track_stats=True,
+    reflection_minibatch_size=2, log_dir=None,
+)
+optimized = optimizer.compile(program, trainset=trainset, valset=valset)
+optimized.save("program.json", save_program=False)
+```
+
+Exactly one budget is mandatory. The adapter deliberately keeps `log_dir=None`:
+GEPA 0.1.4's on-disk optimizer checkpoint format uses pickle even though portable
+DSPy program state can be JSON. Instead, the runner saves JSON program state,
+candidates, statistics, usage counters and its own status event log. It does not
+vendor DSPy or implement another optimizer. GEPA runtime support is Python
+3.10–3.14; its dependency is omitted upstream on Python 3.15, so bootstrap rejects
+that unsupported combination. Python 3.12 is recommended for this smoke workflow.
+
+### Workflow JobSpecs and backward compatibility
+
+`load_job` now dispatches a discriminated `WorkflowJobSpec`:
+
+- `kind: model_training` uses the original `JobSpec` class and training resolver.
+- `kind: prompt_optimization` uses `PromptJobSpec` and `resolve_optimizer`.
+- Old jobs without `kind` retain their model-training interpretation. Training
+  checkpoint digests explicitly exclude the new default field, preserving existing
+  checkpoint identity rather than invalidating old manifests.
+
+Unknown settings remain errors. Prompt jobs reject training/LoRA settings;
+training jobs reject student/reflection/program/optimizer fields. A minimal prompt
+job looks like this; see the complete [synthetic smoke](examples/jobs/tiny-gepa-prompt.yaml):
+
+```yaml
+version: 1
+kind: prompt_optimization
+run_id: ux-gepa-smoke
+program:
+  type: predict
+  signature: "question -> answer"
+student:
+  model: openai/gpt-4.1-mini
+  api_base: null
+  api_key_secret: STUDENT_API_KEY
+  temperature: 0
+  max_tokens: 128
+reflection:
+  model: openai/gpt-4.1-mini
+  api_base: null
+  api_key_secret: REFLECTION_API_KEY
+  temperature: 1
+  max_tokens: 768
+optimizer:
+  type: gepa
+  max_metric_calls: 16
+  num_threads: 1
+  track_stats: true
+dataset:
+  train: [{question: "Train question", answer: "gold"}]
+  validation: [{question: "Validation question", answer: "gold"}]
+  test: [{question: "Held-out question", answer: "gold"}]
+metric:
+  type: exact_match_with_feedback
+artifacts:
+  hf_repo: null
+  publish: false
+```
+
+The explicit program registry supports `predict`, `chain_of_thought` and `react`.
+Initial signatures are untyped text inputs with one text output; no executable
+signature strings or arbitrary imports. ReAct defaults to three iterations and
+an empty tool list (DSPy's built-in finish behavior). Named tools are a future
+trusted-code registry boundary; unknown names fail instead of loading code.
+
+### Student versus reflection LM and provider configuration
+
+The student answers task examples. The reflection LM critiques optimization
+traces and proposes instructions. Each has independent model, endpoint, secret
+name, temperature and token cap. There is no global `dspy.configure` mutation;
+short-lived `dspy.context` scopes end between staged notebook calls.
+
+Use DSPy's `provider/model` convention. For OpenAI-compatible gateways, use
+`openai/<served-model-name>` with the gateway's `/v1` base URL. The same interface
+supports OpenAI cloud, FreeLLM/gateways, Helmholtz endpoints, local Gemma services,
+Nemotron services and other OpenAI-compatible deployments. Model-specific API and
+context-window compatibility still depends on the chosen provider.
+
+These environment variables override the corresponding role independently:
+
+```text
+STUDENT_MODEL          STUDENT_API_BASE          STUDENT_API_KEY
+REFLECTION_MODEL       REFLECTION_API_BASE       REFLECTION_API_KEY
+```
+
+For example, set `STUDENT_MODEL=openai/gemma` and
+`STUDENT_API_BASE=http://localhost:8000/v1` while keeping reflection on a cloud
+model, or set a different `REFLECTION_API_BASE` for a strong remote endpoint.
+Credential values belong in Colab/Kaggle Secrets or environment settings, never
+in YAML, notebook cells, URLs, result files or the command history. Existing
+`get_secret` prefers the platform provider and falls back to environment variables.
+The LM factory resolves only requested key names at execution; HF credentials are
+not requested unless publication is enabled. A keyless explicit endpoint may omit
+`api_key_secret`; authenticated endpoints should always name the required binding.
+
+DSPy imposes special limits on reasoning families such as `openai/gpt-5.4`: the
+caller must explicitly choose `max_tokens>=16000` and temperature `null` or `1`.
+The adapter refuses an incompatible small cap rather than silently increasing it.
+The smoke uses cheaper non-reasoning models with small explicit caps. Custom LM
+providers and endpoint behavior remain unverified against live services here.
+
+### Datasets, metrics and held-out isolation
+
+Each split accepts inline example objects, a local JSON array, or local JSONL.
+Relative paths are resolved from the caller's current directory. An optional
+HF-backed source is supported with a bounded streaming read:
+
+```yaml
+train:
+  type: hf
+  id: owner/dataset
+  config: optional-config
+  split: train
+  limit: 10
+```
+
+Only HF sources need the optional `datasets` package; bootstrap adds it when one
+is selected. Inline/local datasets need neither datasets nor pandas. Rows must
+contain string values for the signature's inputs and output. Extra source columns
+are not DSPy inputs. Input duplicates across train/validation/test are rejected,
+even when labels differ. Examples are normalized centrally using
+`dspy.Example(...).with_inputs(...)`; output labels never become input fields.
+
+Metric factories are an explicit extensible registry:
+
+- `exact_match`: numeric score after trimming whitespace and ignoring case.
+- `exact_match_with_feedback`: the same score as
+  `dspy.Prediction(score=..., feedback=...)`, including the expected/received answer
+  on mismatch. It accepts GEPA's five metric arguments and makes no extra LM calls.
+- `contains`: whether a nonempty normalized gold answer is contained in prediction.
+
+Baseline validation is evaluated before compilation. GEPA sees **only train and
+validation**. Both baseline-test and optimized-test evaluations happen **after**
+compilation, keeping held-out data away from proposal generation and candidate
+selection. The result stores both comparisons and `delta_test`. The synthetic job
+has 10 train, 4 validation and 4 test examples; it checks orchestration, not quality.
+
+### Budgets, execution and usage
+
+Install only the selected CPU optimizer dependencies:
+
+```bash
+python -m pip install -e '.[gepa,test]'
+python -m training_master.runner examples/jobs/tiny-gepa-prompt.yaml --plan
+```
+
+Planning requires no API keys, makes no LM calls and needs no GPU/hardware profile.
+The report shows both endpoint/model settings, token caps, split sizes, metric,
+threads and scheduling budget. It also reports the additional baseline/final
+validation/test evaluations: with four validation and four test rows, these add
+16 metric evaluations beyond the optimization budget. For auto presets, the
+estimate calls the installed DSPy `auto_budget` helper. `light` is already 396
+optimization metric calls for a one-predictor program with four validation rows;
+therefore the smoke uses **16 explicit metric calls**, not an implicit preset.
+
+GEPA's metric-call cap is a **scheduling budget**, not a hard provider-call/dollar
+quota: in-flight batches can overshoot; reflection calls, adapter formatting
+retries and ReAct iterations add LM requests. Provider retries are set to zero,
+and the LM cache is disabled. The runner persists observed student/reflection
+history-entry counts and token usage, plus actual GEPA metric-call statistics
+when `track_stats` is enabled. SDK histories may be truncated. No dollar price or
+unavailable usage is invented.
+
+After inspecting the plan and configuring the two secret bindings, actual API
+usage is explicitly enabled by:
+
+```bash
+python -m training_master.runner examples/jobs/tiny-gepa-prompt.yaml --execute
+```
+
+Use a new `run_id` for every independent run. There is no optimizer-state resume
+in this implementation. A lost runtime can recover saved optimized JSON programs,
+but it cannot resume a partially completed GEPA search. Existing training
+checkpoint/resume behavior is unchanged.
+
+### Colab CPU and Kaggle CPU notebook
+
+Open [Prompt_Optimization_GEPA.ipynb](nb/Prompt_Optimization_GEPA.ipynb).
+
+1. Supply this GEPA-capable checkout or set `TRAINING_MASTER_REF` to its published
+   immutable fork commit. These changes are local until you publish them yourself;
+   the previously pushed training-only commit cannot bootstrap the GEPA package.
+2. Choose a CPU Python 3.12 runtime. On Kaggle enable Internet for dependency
+   installation and provider requests. GPU acceleration is optional.
+3. Add `STUDENT_API_KEY` and `REFLECTION_API_KEY` in the platform's secret settings;
+   grant/attach access to the notebook. Use environment variables for endpoint/model
+   overrides as needed. Do not add HF credentials for the default local-only run.
+4. Run source/bootstrap/JobSpec/Resolve cells with `RUN_OPTIMIZATION=False` first.
+   Review endpoint destinations, token caps and the small metric-call budget.
+5. Set `RUN_OPTIMIZATION=True` and rerun Resolve, Baseline, Optimize and Evaluate.
+   The cells call reusable `PromptExecution.baseline()`, `.optimize()` and
+   `.evaluate()`; the CLI's `.execute()` drives the same stages in one call.
+6. Inspect Artifacts. To rerun, change `run_id`. If dependency installation changes
+   an imported module, restart the kernel before running the execution cells.
+
+### Prompt artifacts and statuses
+
+```text
+runs/<run_id>/
+  job.yaml, hardware.json, resolved.json, status.json
+  baseline/program.json, baseline/metrics.json
+  optimization/stats.json, optimization/candidates.json, optimization/usage.json
+  optimization/logs/events.jsonl
+  optimized/program.json, optimized/metrics.json
+  test/baseline.json, test/optimized.json
+  result.json
+```
+
+Program JSON is saved through DSPy's state-only `save(..., save_program=False)`
+after detaching bound LMs. Load it with
+`training_master.programs.load_program(job.program, path, lm=student_lm)`, which
+rebuilds the registered program and loads JSON with pickle and unsafe LM-state
+loading disabled. The program definition lives in `job.yaml`; no Python program
+pickle or credentials are embedded.
+
+`status.json` and JSONL events expose `PREPARING`, `BASELINE_EVAL`, `OPTIMIZING`,
+`TESTING`, optional `PUBLISHING`, `COMPLETED`, or `FAILED`. Failure records contain
+the exception type, not provider response bodies/keys. These files can be polled
+by a future OpenOperator integration. Local files remain disposable staging state.
+
+Optional HF synchronization reuses the existing model-repository adapter and
+`runs/<run_id>/...` layout. **`artifacts.publish: false` is the default**. An upload
+requires explicit `artifacts.publish: true` and an existing `hf_repo`; CLI
+`--publish` alone cannot override a job that forbids publication. Tests use fake Hub
+clients only. No artifacts were uploaded during development.
+
+### Future GEPA → fine-tune → GEPA loop
+
+A later workflow may export optimized prompts and successful traces, fine-tune a
+model through Soup/Unsloth, then run GEPA again against the adapted student. DSPy's
+BetterTogether remains a relevant reference for combined prompt/weight optimization.
+It is documentation only here: no BetterTogether implementation, automatic training
+handoff, trace export contract or new model-training engine is added.
+
+### GEPA verification performed
+
+Against the preceding Training Master baseline `d20518f72485dae2d4f73cfb21e0ccfb9b8fc8a6`:
+
+- Prompt unit tests + real DSPy runtime contracts + original Training Master tests:
+  **128 passed** on Python 3.12. Real DSPy uses local `DummyLM`s; network connections
+  are prohibited in the runtime tests. The real search produces no claimed quality
+  improvement on the scripted perfect-answer fixture.
+- Prompt/training/CI-coverage contracts on the default Python 3.13 environment:
+  **224 passed**. The CPU-only CLI plan also works without installing DSPy or
+  providing API credentials.
+- Full inherited CPU suite: **15,488 passed, 571 skipped, 18 failed**. All 18 failing
+  test IDs exactly match the pre-existing Qwen pin/selector and generated-script
+  parity failures. Optional real-DSPy tests are exercised separately above; the
+  heavyweight training API-drift matrix was not run.
+- GEPA notebook JSON/schema, generated-script parity, source Ruff/narrow lint,
+  compilation, dynamic-execution checks and frozen lockfile consistency passed.
+- No real student/reflection endpoint, paid API optimization, GPU run, HF upload,
+  Git push or external publication was performed. JSON recovery was tested locally;
+  partially completed optimizer searches are not resumable.
+
+Usage history counters are observed SDK history, not a complete billing ledger:
+histories can be truncated or belong to deep-copied programs. GEPA's own metric-call
+statistics are saved separately. Live endpoint compatibility, real optimization
+quality and real provider token/cost totals remain unverified.
