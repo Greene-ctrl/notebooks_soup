@@ -13,6 +13,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gepa = ["dspy==3.4.1; python_version < '3.15'"]
 hub = ["huggingface-hub>=0.34,<3"]
 test = ["pytest>=8", "pyspellchecker", "tqdm", "huggingface-hub>=0.34,<3"]
 

@@ -8,13 +8,13 @@ from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter, field_validator, model_validator
 
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
 
 
 class Spec(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, validate_default=True, allow_inf_nan=False)
+    model_config = ConfigDict(extra="forbid", frozen=True, validate_default=True, allow_inf_nan=False, hide_input_in_errors=True)
 
 
 class ModelSpec(Spec):
@@ -92,6 +92,7 @@ class ResumeSpec(Spec):
 
 
 class JobSpec(Spec):
+    kind: Literal["model_training"] = "model_training"
     version: Literal[1] = 1
     run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$")
     model: ModelSpec
@@ -111,16 +112,125 @@ class JobSpec(Spec):
         return value
 
 
-def load_job(source: JobSpec | dict | str | Path) -> JobSpec:
+class ProgramSpec(Spec):
+    type: Literal["predict", "chain_of_thought", "react"] = "predict"
+    signature: str = "question -> answer"
+    tools: list[str] = Field(default_factory=list)
+    max_iters: PositiveInt = 3
+
+    @model_validator(mode="after")
+    def explicit_registry(self):
+        from .programs.registry import signature_fields
+        signature_fields(self.signature)
+        if self.type != "react" and (self.tools or self.max_iters != 3):
+            raise ValueError("program.tools/max_iters apply only to react")
+        return self
+
+
+class LMSpec(Spec):
+    model: str = Field(min_length=1)
+    api_base: str | None = None
+    api_key_secret: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    max_tokens: PositiveInt = 512
+
+    @model_validator(mode="after")
+    def endpoint(self):
+        if "/" not in self.model or any(c.isspace() for c in self.model):
+            raise ValueError("LM model must use DSPy's provider/model convention")
+        if self.api_base:
+            p = urlsplit(self.api_base)
+            if p.scheme not in ("http", "https") or not p.hostname or p.username or p.password or p.query or p.fragment:
+                raise ValueError("api_base must be an HTTP(S) endpoint without credentials, query or fragment")
+            if not self.model.startswith("openai/"):
+                raise ValueError("OpenAI-compatible api_base requires model=openai/<served-model>")
+        return self
+
+
+class GEPAConfig(Spec):
+    type: Literal["gepa"]
+    budget: Literal["light", "medium", "heavy"] | None = None
+    max_metric_calls: PositiveInt | None = None
+    num_threads: Annotated[StrictInt, Field(ge=1, le=16)] = 1
+    track_stats: bool = True
+    seed: Annotated[StrictInt, Field(ge=0)] = 0
+
+    @model_validator(mode="after")
+    def one_budget(self):
+        if (self.budget is None) == (self.max_metric_calls is None):
+            raise ValueError("GEPA requires exactly one of optimizer.budget or optimizer.max_metric_calls")
+        return self
+
+
+class HFDatasetSpec(Spec):
+    type: Literal["hf"]
+    id: str = Field(min_length=1)
+    config: str | None = None
+    split: str = "train"
+    limit: PositiveInt
+
+
+ExampleSource = list[dict[str, str]] | str | HFDatasetSpec
+
+
+class PromptDatasetSpec(Spec):
+    train: ExampleSource
+    validation: ExampleSource
+    test: ExampleSource
+
+
+class MetricSpec(Spec):
+    type: Literal["exact_match", "exact_match_with_feedback", "contains"]
+
+
+class PromptArtifactSpec(Spec):
+    hf_repo: str | None = None
+    publish: bool = False
+
+    _repo_id = field_validator("hf_repo")(ArtifactSpec.repo_id.__func__)
+
+    @model_validator(mode="after")
+    def target_for_publication(self):
+        if self.publish and not self.hf_repo:
+            raise ValueError("artifacts.publish=true requires artifacts.hf_repo")
+        return self
+
+
+class PromptJobSpec(Spec):
+    version: Literal[1] = 1
+    kind: Literal["prompt_optimization"]
+    run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$")
+    program: ProgramSpec
+    student: LMSpec
+    reflection: LMSpec
+    optimizer: GEPAConfig
+    dataset: PromptDatasetSpec
+    metric: MetricSpec
+    artifacts: PromptArtifactSpec = Field(default_factory=PromptArtifactSpec)
+
+    _integer_version = field_validator("version", mode="before")(JobSpec.integer_version.__func__)
+
+
+WorkflowJobSpec = Annotated[JobSpec | PromptJobSpec, Field(discriminator="kind")]
+_WORKFLOW_ADAPTER = TypeAdapter(WorkflowJobSpec)
+
+
+def parse_job(value: dict) -> JobSpec | PromptJobSpec:
+    if not isinstance(value, dict):
+        raise ValueError("JobSpec must be a mapping")
+    return _WORKFLOW_ADAPTER.validate_python({"kind": "model_training", **value})
+
+
+def load_job(source: JobSpec | PromptJobSpec | dict | str | Path) -> JobSpec | PromptJobSpec:
     """Load an injected dict, local YAML/JSON, HTTPS URL, or hf://repo/path.
 
     Remote jobs are data only: YAML safe_load, strict schema, no executable hooks.
     Never put credentials in JobSpec URLs; provider authentication is separate.
     """
-    if isinstance(source, JobSpec):
+    if isinstance(source, (JobSpec, PromptJobSpec)):
         return source
     if isinstance(source, dict):
-        return JobSpec.model_validate(source)
+        return parse_job(source)
     text_source = str(source)
     if text_source.startswith("hf://"):
         from huggingface_hub import hf_hub_download
@@ -148,12 +258,16 @@ def load_job(source: JobSpec | dict | str | Path) -> JobSpec:
         if path.stat().st_size > 1024 * 1024:
             raise ValueError("JobSpec exceeds 1 MiB")
         text = path.read_text(encoding="utf-8")
-    return JobSpec.model_validate(yaml.safe_load(text))
+    return parse_job(yaml.safe_load(text))
 
 
-def job_digest(job: JobSpec) -> str:
+def job_digest(job: JobSpec | PromptJobSpec) -> str:
     """Training identity for resume; requested engine/runtime and storage may vary."""
     import hashlib
-    data = job.model_dump(mode="json", exclude={"engine", "artifacts", "resume", "requirements"})
-    data["backend"] = job.engine.backend or "transformers"
+    # Preserve pre-kind training digests so existing checkpoints remain resumable.
+    data = job.model_dump(mode="json", exclude={"kind", "engine", "artifacts", "resume", "requirements"})
+    if isinstance(job, JobSpec):
+        data["backend"] = job.engine.backend or "transformers"
+    else:
+        data["kind"] = job.kind
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()

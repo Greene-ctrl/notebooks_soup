@@ -4,7 +4,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import importlib.metadata
-from .job import JobSpec
+from .job import JobSpec, PromptJobSpec, HFDatasetSpec
 
 SOUP_VERSION = "0.76.0"
 SOUP_REF = "d5cb1a7e87a0042de27b83947f6948c3ca9456b7"
@@ -43,6 +43,13 @@ def selected_bootstrap_engine(job: JobSpec) -> str:
 
 
 def install_command(job: JobSpec, *, training: bool = False) -> list[str]:
+    if isinstance(job, PromptJobSpec):
+        if not (3, 10) <= sys.version_info[:2] < (3, 15):
+            raise RuntimeError("DSPy GEPA 3.4.1 requires Python 3.10–3.14")
+        requirements = ["dspy==3.4.1"]
+        if any(isinstance(getattr(job.dataset, split), HFDatasetSpec) for split in ("train", "validation", "test")):
+            requirements.append("datasets>=2.14")
+        return [sys.executable, "-m", "pip", "install", *requirements]
     engine = selected_bootstrap_engine(job)
     if engine == "nemo_automodel":
         raise ValueError("NeMo AutoModel is opt-in: use an NVIDIA-supported environment/recipe; automatic installation is not provided")

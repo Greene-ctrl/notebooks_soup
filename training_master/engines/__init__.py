@@ -3,9 +3,12 @@ from .base import TrainingEngine, UnsupportedJob, hardware_errors
 from .nemo_automodel import NemoAutoModelEngine
 from .soup import SoupEngine
 from .unsloth import UnslothEngine
+from ..job import JobSpec
 
 
 def resolve_engine(job, hardware, *, engines=None, allow_unavailable: bool = False) -> TrainingEngine:
+    if not isinstance(job, JobSpec):
+        raise ValueError("Training engine resolver requires kind=model_training; use resolve_optimizer for prompts")
     registry = engines if engines is not None else {
         "soup": SoupEngine(), "unsloth": UnslothEngine(), "nemo_automodel": NemoAutoModelEngine(),
     }

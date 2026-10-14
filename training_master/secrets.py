@@ -26,9 +26,9 @@ def get_secret(name: str, platform: RuntimePlatform | None = None, *, required: 
     return value
 
 
-def restore_secrets(platform: RuntimePlatform | None = None) -> dict[str, bool]:
+def restore_secrets(platform: RuntimePlatform | None = None, *, names=SECRET_NAMES) -> dict[str, bool]:
     presence = {}
-    for name in SECRET_NAMES:
+    for name in names:
         value = get_secret(name, platform)
         if value:
             os.environ[name] = value

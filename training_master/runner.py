@@ -7,6 +7,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
+import sys
 
 import yaml
 
@@ -14,7 +15,7 @@ from .artifacts import HFArtifactStore, RunPaths, write_json
 from .checkpoint import find_latest_checkpoint, publish_checkpoint, restore_checkpoint
 from .engines import TrainingEngine, resolve_engine
 from .hardware import HardwareProfile, probe_hardware
-from .job import JobSpec, job_digest, load_job
+from .job import JobSpec, PromptJobSpec, job_digest, load_job
 from .platform import RuntimePlatform, detect_platform
 from .secrets import get_secret, restore_secrets
 
@@ -112,6 +113,11 @@ class Execution:
 
 def prepare_execution(source: JobSpec | dict | str | Path, *, platform: RuntimePlatform | None = None, hardware: HardwareProfile | None = None, output_dir: str | Path | None = None, planning_only: bool = False, engines=None) -> Execution:
     job = load_job(source)
+    if isinstance(job, PromptJobSpec):
+        if engines is not None:
+            raise ValueError("Training engine overrides do not apply to prompt optimization")
+        from .prompt_runner import prepare_prompt_execution
+        return prepare_prompt_execution(job, platform=platform, hardware=hardware, output_dir=output_dir, planning_only=planning_only)
     platform = platform or detect_platform()
     hardware = hardware or probe_hardware(platform)
     engine = resolve_engine(job, hardware, engines=engines, allow_unavailable=planning_only)
@@ -146,7 +152,15 @@ def main() -> None:
         parser.error("--hardware-profile requires --plan")
     hardware = HardwareProfile(**json.loads(Path(args.hardware_profile).read_text())) if args.hardware_profile else None
     execution = prepare_execution(args.job, output_dir=args.output_dir, hardware=hardware, planning_only=args.plan)
-    result = execution.execute(publish=args.publish) if args.execute else execution.dry_run(cli=args.cli_preflight)
+    if args.execute:
+        if isinstance(execution.job, PromptJobSpec):
+            print(json.dumps({"preflight": execution.dry_run()}, indent=2), file=sys.stderr, flush=True)
+        # Prompt publication also requires an explicit JobSpec setting. Preserve
+        # the existing model-training CLI's upload behavior unchanged.
+        publish = (True if args.publish else None) if isinstance(execution.job, PromptJobSpec) else args.publish
+        result = execution.execute(publish=publish)
+    else:
+        result = execution.dry_run(cli=args.cli_preflight)
     print(json.dumps(result, indent=2))
 
 
