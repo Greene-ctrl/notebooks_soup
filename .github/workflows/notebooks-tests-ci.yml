@@ -91,7 +91,7 @@ jobs:
             pyspellchecker tqdm huggingface_hub
 
       - name: Training Master CPU contracts
-        run: python -m pytest tests/test_training_master.py tests/test_prompt_optimization.py -q --tb=short
+        run: python -m pytest tests/test_training_master.py tests/test_training_diagnostics.py tests/test_prompt_optimization.py -q --tb=short
 
       - name: tests/test_notebook_json_validity.py
         run: |
@@ -447,3 +447,20 @@ jobs:
       - run: pip install pytest pyyaml
 
       - run: python -m pytest tests/security -v --tb=short
+
+  soup-cpu-validation:
+    name: Training Master pinned Soup validation (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Install Soup core only (no torch or model weights)
+        run: >-
+          python -m pip install pytest pyyaml 'pydantic>=2,<3'
+          'soup-cli @ git+https://github.com/MakazhanAlpamys/Soup.git@d5cb1a7e87a0042de27b83947f6948c3ca9456b7'
+      - run: python -m pytest tests/test_soup_validation.py tests/test_training_diagnostics.py -q --tb=short

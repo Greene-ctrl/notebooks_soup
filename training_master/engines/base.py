@@ -68,7 +68,8 @@ def materialize_dataset(job: JobSpec, paths: RunPaths) -> Path:
     rows; no platform-specific data decisions and no model/tokenizer download.
     """
     spec = job.dataset
-    source = Path(spec.source)
+    from ..paths import REPO_ROOT, resolve_runtime_path
+    source = Path(resolve_runtime_path(spec.source, repo_root=REPO_ROOT))
     if source.is_file():
         if spec.config is not None or spec.split != "train":
             raise UnsupportedJob("dataset.config/split cannot select a local JSONL split")

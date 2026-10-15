@@ -417,12 +417,12 @@ def test_soup_cli_preflight_uses_current_commands(job, gpu, tmp_path, monkeypatc
     monkeypatch.setattr(SoupEngine, "available", lambda self: True)
     monkeypatch.setattr("training_master.engines.soup.materialize_dataset", lambda *a: paths.root / "data.jsonl")
     run = Mock(return_value=types.SimpleNamespace(returncode=0))
-    monkeypatch.setattr("training_master.engines.soup.subprocess.run", run)
+    monkeypatch.setattr("training_master.engines.soup.run_process", run)
     result = SoupEngine().dry_run(job, gpu, paths, cli=True)
     assert result["cli_preflight"]
     assert run.call_args_list[0].args[0][1:3] == ["doctor", "--config"]
     assert run.call_args_list[1].args[0][-1] == "--dry-run"
-    assert all(call.kwargs["check"] for call in run.call_args_list)
+    assert all(call.kwargs["cwd"] == paths.root for call in run.call_args_list)
 
 
 def test_cli_cannot_execute_synthetic_hardware(monkeypatch):

@@ -18,6 +18,9 @@ from .hardware import HardwareProfile, probe_hardware
 from .job import JobSpec, PromptJobSpec, job_digest, load_job
 from .platform import RuntimePlatform, detect_platform
 from .secrets import get_secret, restore_secrets
+from .paths import REPO_ROOT, resolve_job_paths, resolve_runtime_path
+from .process import EngineProcessError
+from .diagnostics import environment_manifest, run_diagnostics
 
 
 @dataclass
@@ -28,15 +31,24 @@ class Execution:
     engine: TrainingEngine
     paths: RunPaths
     planning_only: bool = False
+    resolved_job: JobSpec | None = None
+    repo_root: Path = REPO_ROOT
 
     def dry_run(self, *, cli: bool = False) -> dict:
+        try:
+            return self._dry_run(cli=cli)
+        except BaseException as error:
+            self._failed(error, "PREFLIGHT")
+            raise
+
+    def _dry_run(self, *, cli: bool = False) -> dict:
         from .engines import SoupEngine
         if isinstance(self.engine, SoupEngine):
-            detail = self.engine.dry_run(self.job, self.hardware, self.paths, cli=cli)
+            detail = self.engine.dry_run(self.resolved_job or self.job, self.hardware, self.paths, cli=cli)
         else:
             if cli:
                 raise ValueError("CLI preflight is provided only for Soup")
-            detail = self.engine.dry_run(self.job, self.hardware, self.paths)
+            detail = self.engine.dry_run(self.resolved_job or self.job, self.hardware, self.paths)
         result = {
             "run_id": self.job.run_id, "platform": self.platform.name,
             "requested_engine": self.job.engine.type, "resolved_engine": self.engine.name,
@@ -47,40 +59,95 @@ class Execution:
             "status": "planned" if self.planning_only else "validated",
         }
         try:
-            source_root = Path(__file__).resolve().parents[1]
+            source_root = self.repo_root
             result["runner_commit"] = subprocess.check_output(["git", "-C", str(source_root), "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
         except (OSError, subprocess.SubprocessError):
             result["runner_commit"] = None
-        write_json(self.paths.root / "resolved.json", result)
+        manifest = json.loads((self.paths.root / "resolved.json").read_text())
+        manifest.update(result)
+        write_json(self.paths.root / "resolved.json", manifest)
         return result
+
+    def _failed(self, error, stage):
+        detail = {"status": "failed", "state": "FAILED", "stage": stage,
+                  "run_id": self.job.run_id, "engine": self.engine.name, "error_type": type(error).__name__}
+        process_error = error if isinstance(error, EngineProcessError) else getattr(error, "engine_process_result", None)
+        if process_error is not None:
+            detail.update(exit_code=process_error.exit_code, log_path=process_error.log_path)
+        write_json(self.paths.root / "status.json", detail)
+
+    def validate(self) -> dict:
+        """Validate data and engine before any training. No model weights loaded."""
+        try:
+            from .engines import SoupEngine, UnslothEngine
+            cli = isinstance(self.engine, SoupEngine) and not self.planning_only
+            dataset_checked = False
+            if not self.planning_only and isinstance(self.engine, UnslothEngine):
+                from .engines.base import materialize_dataset
+                materialize_dataset(self.resolved_job or self.job, self.paths)
+                dataset_checked = True
+            result = self.dry_run(cli=cli)
+            checks = {"PATH CHECK": "PASS", "DATASET CHECK": "PASS" if dataset_checked or result["preflight"].get("cli_preflight") else "UNVERIFIED",
+                      "ENGINE CHECK": "PASS" if self.engine.available() else "UNAVAILABLE",
+                      "SOUP DOCTOR": "PASS" if result["preflight"].get("cli_preflight") else "NOT RUN",
+                      "VRAM PREFLIGHT": "PASS" if self.hardware.cuda_available else "WARN: no CUDA training verified"}
+            for name, state in checks.items():
+                print(f"{name:<18} {state}")
+            return result
+        except BaseException as error:
+            self._failed(error, "PREFLIGHT")
+            raise
+
+    def show_preflight(self, *, publish: bool = False) -> None:
+        manifest = json.loads((self.paths.root / "resolved.json").read_text())
+        environment = json.loads((self.paths.root / "environment.json").read_text())
+        print("Training Master preflight")
+        for name, value in {"Platform": self.platform.name, "Python": environment["python"],
+                            "GPU": self.hardware.gpu_names, "VRAM (GB/device)": self.hardware.gpu_vram_gb,
+                            "Run ID": self.job.run_id, "Engine": self.engine.name,
+                            "Engine version": environment["packages"].get("soup-cli" if self.engine.name == "soup" else "unsloth"),
+                            "Repo root": self.repo_root, "Run root": self.paths.root,
+                            "Dataset": manifest["dataset_train"], "Config": manifest["engine_config"],
+                            "Artifact publishing": "enabled" if publish else "disabled"}.items():
+            print(f"{name}: {value}")
+
+    def diagnostics(self) -> dict:
+        return run_diagnostics(self.paths.root)
+
+    def show_diagnostics(self) -> None:
+        from .process import redact
+        print(redact(json.dumps(self.diagnostics(), indent=2)))
 
     def execute(self, *, publish: bool = False) -> dict:
         if self.planning_only:
             raise RuntimeError("Planning-only execution cannot train; resolve again against real hardware and installed engines")
-        if not self.engine.available():
-            raise RuntimeError("Selected engine dependencies are missing; bootstrap only that engine first")
-        restore_secrets(self.platform)
-        store = None
-        if self.job.artifacts.hf_repo:
-            store = HFArtifactStore(self.job.artifacts.hf_repo, get_secret("HF_TOKEN", self.platform, required=publish))
-        elif publish:
-            raise ValueError("Explicit publication requires artifacts.hf_repo")
         status_path = self.paths.root / "status.json"
-        write_json(status_path, {"status": "preparing", "run_id": self.job.run_id})
+        write_json(status_path, {"status": "preparing", "state": "PREPARING", "run_id": self.job.run_id})
+        stage = "PREPARING"
         try:
+            if not self.engine.available():
+                raise RuntimeError("Selected engine dependencies are missing; bootstrap only that engine first")
+            restore_secrets(self.platform)
+            store = None
+            if self.job.artifacts.hf_repo:
+                store = HFArtifactStore(self.job.artifacts.hf_repo, get_secret("HF_TOKEN", self.platform, required=publish))
+            elif publish:
+                raise ValueError("Explicit publication requires artifacts.hf_repo")
             if store:
                 store.check_access()
             resume = restore_checkpoint(self.job, self.paths, engine=self.engine.name, store=store)
             # A previously completed run must not silently retrain the same ID.
             if resume is None and ((self.paths.final / "training_master_final.json").exists() or any(self.paths.trainer.glob("checkpoint-*"))):
                 raise ValueError("Run has existing artifacts but no selected compatible checkpoint; use a new run_id to start fresh")
-            self.dry_run()
-            write_json(status_path, {"status": "running", "run_id": self.job.run_id, "engine": self.engine.name, "resume_checkpoint": str(resume) if resume else None})
+            stage = "PREFLIGHT"
+            self.validate()
+            stage = "TRAINING"
+            write_json(status_path, {"state": "RUNNING", "stage": stage, "status": "running", "run_id": self.job.run_id, "engine": self.engine.name, "resume_checkpoint": str(resume) if resume else None})
 
             def saved(checkpoint):
                 return publish_checkpoint(self.job, checkpoint, engine=self.engine.name, store=store if publish else None)
 
-            result = self.engine.run(self.job, self.hardware, self.paths, resume=resume, on_checkpoint=saved)
+            result = self.engine.run(self.resolved_job or self.job, self.hardware, self.paths, resume=resume, on_checkpoint=saved)
             # Soup's trainer_state is useful even when no periodic save was due.
             trainer_state = self.paths.trainer / "trainer_state.json"
             metrics_source = "final_trainer_state"
@@ -97,9 +164,10 @@ class Execution:
                 "final_metrics_guaranteed": metrics_source == "final_trainer_state" and trainer_state.exists(),
             })
             write_json(self.paths.final / "training_master_final.json", {"job_digest": job_digest(self.job), "engine": self.engine.name})
-            result.update(run_id=self.job.run_id, checkpoint_path=str(self.paths.checkpoints), hf_repo=self.job.artifacts.hf_repo, metrics_path=str(self.paths.root / "metrics"), status="succeeded", published=False)
+            result.update(run_id=self.job.run_id, checkpoint_path=str(self.paths.checkpoints), hf_repo=self.job.artifacts.hf_repo, metrics_path=str(self.paths.root / "metrics"), status="succeeded", state="COMPLETED", published=False)
             write_json(status_path, result)
             if publish:
+                stage = "PUBLISHING"
                 store.publish_run(self.job, self.paths)
                 result["published"] = True
                 write_json(status_path, result)
@@ -107,11 +175,11 @@ class Execution:
         except BaseException as error:
             # Exception strings from third-party HTTP/CLI code can contain URLs
             # or credentials. Keep status safe; original traceback stays local.
-            write_json(status_path, {"status": "failed", "run_id": self.job.run_id, "error_type": type(error).__name__, "engine": self.engine.name})
+            self._failed(error, stage)
             raise
 
 
-def prepare_execution(source: JobSpec | dict | str | Path, *, platform: RuntimePlatform | None = None, hardware: HardwareProfile | None = None, output_dir: str | Path | None = None, planning_only: bool = False, engines=None) -> Execution:
+def prepare_execution(source: JobSpec | dict | str | Path, *, platform: RuntimePlatform | None = None, hardware: HardwareProfile | None = None, output_dir: str | Path | None = None, planning_only: bool = False, engines=None, repo_root: str | Path | None = None) -> Execution:
     job = load_job(source)
     if isinstance(job, PromptJobSpec):
         if engines is not None:
@@ -120,8 +188,10 @@ def prepare_execution(source: JobSpec | dict | str | Path, *, platform: RuntimeP
         return prepare_prompt_execution(job, platform=platform, hardware=hardware, output_dir=output_dir, planning_only=planning_only)
     platform = platform or detect_platform()
     hardware = hardware or probe_hardware(platform)
-    engine = resolve_engine(job, hardware, engines=engines, allow_unavailable=planning_only)
-    paths = RunPaths.for_job(job, output_dir or platform.output_dir)
+    repo_root = Path(repo_root or REPO_ROOT).resolve()
+    runtime_root = platform.working_dir.resolve()
+    output_root = resolve_runtime_path(str(output_dir or platform.output_dir), repo_root=runtime_root, local=True, must_exist=False)
+    paths = RunPaths.for_job(job, output_root)
     existing = paths.root / "job.yaml"
     if existing.exists() and job_digest(load_job(existing)) != job_digest(job):
         raise ValueError("run_id already has a different JobSpec; choose a new run_id")
@@ -131,7 +201,28 @@ def prepare_execution(source: JobSpec | dict | str | Path, *, platform: RuntimeP
     # Do not overwrite a running/completed status merely to inspect a dry run.
     if not (paths.root / "status.json").exists():
         write_json(paths.root / "status.json", {"status": "planned", "run_id": job.run_id})
-    return Execution(job, hardware, platform, engine, paths, planning_only)
+    write_json(paths.root / "environment.json", environment_manifest(repo_root, hardware))
+    manifest = {
+        "run_id": job.run_id, "platform": platform.name, "requested_engine": job.engine.type,
+        "repo_root": str(repo_root), "runtime_root": str(runtime_root), "run_root": str(paths.root),
+        "engine_workdir": str(paths.root), "output_dir": str(paths.trainer),
+        "checkpoint_path": str(paths.checkpoints),
+    }
+    write_json(paths.root / "resolved.json", manifest)
+    try:
+        resolved_job = resolve_job_paths(job, repo_root)
+        engine = resolve_engine(resolved_job, hardware, engines=engines, allow_unavailable=planning_only)
+        manifest.update(engine=engine.name, dataset_train=resolved_job.dataset.source, model=resolved_job.model.id,
+                        engine_config=str(paths.root / "soup.yaml") if engine.name == "soup" else None,
+                        materialized_dataset=str(paths.root / "data.jsonl"), job=resolved_job.model_dump(mode="json"))
+        write_json(paths.root / "resolved.json", manifest)
+        execution = Execution(job, hardware, platform, engine, paths, planning_only, resolved_job, repo_root)
+        engine.prepare(resolved_job, hardware, paths)
+    except BaseException as error:
+        write_json(paths.root / "status.json", {"status": "failed", "state": "FAILED", "stage": "PREPARING",
+                   "run_id": job.run_id, "engine": manifest.get("engine", job.engine.type), "error_type": type(error).__name__})
+        raise
+    return execution
 
 
 def main() -> None:
@@ -140,7 +231,7 @@ def main() -> None:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--hardware-profile", help="Recorded JSON profile for offline planning only")
     parser.add_argument("--plan", action="store_true", help="Allow an absent engine; generate config without training or downloading weights")
-    parser.add_argument("--cli-preflight", action="store_true", help="Run Soup doctor + train --dry-run (requires installed training extras)")
+    parser.add_argument("--cli-preflight", action="store_true", help="Run Soup doctor + train --dry-run (requires pinned Soup core)")
     parser.add_argument("--execute", action="store_true", help="Explicitly start training")
     parser.add_argument("--publish", action="store_true", help="Explicitly enable uploads to artifacts.hf_repo during execution")
     args = parser.parse_args()

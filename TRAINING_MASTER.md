@@ -176,7 +176,7 @@ soup adapters check PATH --json
 The adapter emits only supported fields: `base`, `task`, `backend`, `data.train`,
 `data.format`, `data.max_length`, `data.val_split`, the mapped training/LoRA settings,
 and `output`. Both doctor and train's data dry run must succeed before execution.
-Their output and exit statuses are preserved in `logs/soup.log`. The offline dry-run
+Their output and exit statuses are preserved in `logs/soup-*.log` and `commands/*.json`. The offline dry-run
 path performs JobSpec/config translation without downloading data or weights;
 `--cli-preflight` additionally fetches the small selected dataset and may fetch model
 configuration, but does not instantiate/download model weights.
@@ -644,3 +644,79 @@ Usage history counters are observed SDK history, not a complete billing ledger:
 histories can be truncated or belong to deep-copied programs. GEPA's own metric-call
 statistics are saved separately. Live endpoint compatibility, real optimization
 quality and real provider token/cost totals remain unverified.
+
+## Training notebook diagnostics and deterministic resources
+
+Training resources resolve against `repo_root` (the runner checkout by default),
+not the notebook working directory or the YAML file's directory. Pass an explicit
+`repo_root=ROOT` for another checkout. `resolve_runtime_path` canonicalizes absolute
+paths, `./`, `../`, `~/`, `file://`, known local file suffixes, and existing entries
+under that root. A missing explicit local resource fails during preparation;
+ambiguous `owner/name` strings remain Hub IDs. Use `./models/name` for a missing
+local model directory so it cannot be mistaken for a Hub ID. HTTPS and `hf://`
+identifiers stay remote; credentials/query strings in resource URLs are rejected.
+The current training schema supports one dataset source; unsupported split paths,
+custom reward/metric scripts and checkpoint path overrides remain schema errors.
+
+The roots have distinct purposes:
+
+| Root | Meaning |
+| --- | --- |
+| `repo_root` | Source checkout and base for local resources |
+| `runtime_root` | Platform working directory (`/content`, `/kaggle/working`, or local root) |
+| `run_root` | Absolute `<output root>/<run_id>` |
+| `engine_workdir` | Explicit `run_root` cwd for Soup commands |
+| `output_dir` | Absolute Trainer output, `run_root/checkpoints/trainer` |
+
+Relative output overrides resolve against `runtime_root`. Generated configs contain
+absolute local model/data/output paths. Dataset rows normalize into the absolute
+`run_root/data.jsonl`. The original JobSpec remains in `job.yaml` and retains its
+checkpoint digest; resolved engine inputs and roots are in `resolved.json`.
+`environment.json` records Python/executable, source SHA, package versions, CUDA
+and GPU metadata without environment-variable dumps.
+
+`prepare()` writes engine files once. `dry_run()` validates the generated config;
+CLI preflight materializes data, runs Soup doctor, then `train --dry-run`.
+`Execution.validate()` performs that preflight for an executable Soup run.
+`execute()` repeats validation before training, and `SoupEngine.run()` reuses the
+validated config/data fingerprint. Direct engine calls also require preflight.
+No training is launched after a failed check. Offline planning is explicitly
+unverified for dataset/doctor checks and cannot execute training.
+
+```python
+job = load_job(ROOT / "examples/jobs/tiny-soup-sft.yaml")
+execution = prepare_execution(job, repo_root=ROOT)
+execution.show_preflight(publish=False)
+execution.validate()
+result = execution.execute(publish=False)
+# Independently callable after a failed execution cell:
+execution.show_diagnostics()
+```
+
+If preparation itself fails before assigning `execution`, use
+`training_master.diagnostics.show_run_diagnostics(run_root)`. Diagnostics include
+status/stage, paths, engine version, config, latest command/exit code, a bounded
+log tail, checkpoint directories and final artifact state.
+
+Soup stdout/stderr are merged in order, streamed live, and persisted in
+`logs/soup-doctor.log`, `logs/soup-dry-run.log`, and `logs/soup-train.log`.
+Matching `commands/*.json` files record exact argv, explicit cwd, timestamps,
+duration, exit code and interruption state. Retries get numbered filenames,
+preserving previous attempts. `EngineProcessError` includes the command, code,
+log path and last 100 lines (also bounded to 24,000 characters). Configure
+`SoupEngine(tail_lines=80)` or the reusable `run_process` tail limits as needed.
+`stderr_tail` is empty because the combined ordered output is in `stdout_tail`.
+Known environment secret values and common provider token forms are redacted
+before persistence/display. Never put credentials into jobs or command arguments.
+Ctrl+C terminates the child process group on POSIX, escalates to kill if necessary,
+and persists command/failure state before re-raising. Complete logs/configs and
+existing checkpoints remain available after failure.
+
+The smoke job now uses eight bundled synthetic plaintext rows rather than a
+remote dataset. Its public `SmolLM2-135M` model still requires a first model/tokenizer
+download for actual training. It uses LoRA, one epoch, batch size 1, max length 128,
+no W&B and no publication. Soup defaults to **4bit**: the adapter explicitly writes
+`quantization: none` to honor an unquantized job; omitting that field would enable
+quantization on GPU. Soup 0.76.0 has no `--version` flag, so bootstrap prints its
+installed distribution version and verifies the executable belongs to the kernel's
+environment. Python 3.10–3.12 is required for these training bootloaders.

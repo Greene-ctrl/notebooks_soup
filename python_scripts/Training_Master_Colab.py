@@ -21,12 +21,15 @@ from pathlib import Path
 
 REPO_URL = "https://github.com/JsonLord/notebooks_soup.git"
 REPO_REF = os.environ.get("TRAINING_MASTER_REF", "SET_TO_PUBLISHED_COMMIT_SHA")
-ROOT = Path(os.environ.get("TRAINING_MASTER_CHECKOUT", str(Path.cwd()))).resolve()
-if not (ROOT / "training_master" / "__init__.py").is_file():
+local_checkout = os.environ.get("TRAINING_MASTER_CHECKOUT")
+base = Path("/kaggle/working") if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.environ.get("KAGGLE_URL_BASE") else Path("/content") if Path("/content").is_dir() else Path.cwd()
+ROOT = Path(local_checkout).resolve() if local_checkout else base / "training-master-source"
+if local_checkout:
+    if not (ROOT / "training_master" / "__init__.py").is_file():
+        raise ValueError("TRAINING_MASTER_CHECKOUT must contain Training Master")
+else:
     if len(REPO_REF) != 40 or any(c not in "0123456789abcdef" for c in REPO_REF):
         raise ValueError("Set TRAINING_MASTER_REF to the published runner commit SHA")
-    base = Path("/kaggle/working") if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") else Path("/content") if Path("/content").is_dir() else Path.cwd()
-    ROOT = base / "training-master-source"
     if not ROOT.exists():
         subprocess.run(["git", "init", str(ROOT)], check=True)
         subprocess.run(["git", "-C", str(ROOT), "remote", "add", "origin", REPO_URL], check=True)
@@ -35,6 +38,10 @@ if not (ROOT / "training_master" / "__init__.py").is_file():
     actual = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
     if actual != REPO_REF:
         raise ValueError("Existing runner checkout differs; use a fresh source directory")
+actual = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+print("Runner SHA:", actual)
+print("Python executable:", sys.executable)
+print("Python version:", sys.version.split()[0])
 # Lightweight runner requirements only; training extras are selected later.
 subprocess.run([sys.executable, "-m", "pip", "install", "pydantic>=2,<3", "pyyaml>=6"], check=True)
 sys.path.insert(0, str(ROOT))
@@ -42,6 +49,8 @@ if "training_master" in sys.modules:
     loaded_root = Path(sys.modules["training_master"].__file__).resolve().parents[1]
     if loaded_root != ROOT:
         raise RuntimeError("Runner source changed in this kernel; restart and rerun")
+if not (3, 10) <= sys.version_info[:2] < (3, 13):
+    raise RuntimeError("Model-training bootstrap requires Python 3.10–3.12; select a Python 3.12 runtime")
 
 
 # ## 1 — Runtime information
@@ -75,7 +84,7 @@ print(restore_secrets(runtime))
 # In[ ]:
 
 
-from training_master.bootstrap import bootstrap
+from training_master.bootstrap import bootstrap, verify_engine_environment
 from training_master.job import load_job
 from training_master.runner import prepare_execution
 
@@ -84,26 +93,15 @@ PUBLISH_ARTIFACTS = False
 
 
 # ## 4 — Job
-# Edit the dict or set `JOB_SPEC_PATH`/`JOB_SPEC_URL`/`HF_JOB_SPEC` to load YAML/JSON. OpenOperator can inject the same JobSpec. Never place tokens in it.
+# The default uses the bundled tiny dataset. Set `JOB_SPEC_PATH`/`JOB_SPEC_URL`/`HF_JOB_SPEC` to load another YAML/JSON job. OpenOperator can inject the same JobSpec. Never place tokens in it.
 
 # In[ ]:
 
 
-JOB_SPEC = {
-    "version": 1, "run_id": "tiny-soup-sft-001",
-    "model": {"id": "HuggingFaceTB/SmolLM2-135M"},
-    "dataset": {"source": "Salesforce/wikitext", "config": "wikitext-2-raw-v1",
-                "split": "train", "format": "plaintext", "limit": 8},
-    "task": {"type": "sft"}, "engine": {"type": "auto"},
-    "training": {"epochs": 1, "batch_size": 1, "max_length": 128,
-                 "quantization": "none", "lora": {"enabled": True, "r": 8, "alpha": 16}},
-    "artifacts": {"hf_repo": None, "checkpoint_interval": 2},
-    "requirements": {"min_vram_gb": 1}, "resume": {"mode": "auto"},
-}
-JOB_SPEC_PATH = None
+JOB_SPEC_PATH = ROOT / "examples/jobs/tiny-soup-sft.yaml"
 JOB_SPEC_URL = None
-HF_JOB_SPEC = None  # hf://owner/repository/path/to/job.yaml (model repo)
-job = load_job(JOB_SPEC_PATH or JOB_SPEC_URL or HF_JOB_SPEC or JOB_SPEC)
+HF_JOB_SPEC = None  # hf://owner/repository/path/to/job.yaml
+job = load_job(JOB_SPEC_URL or HF_JOB_SPEC or JOB_SPEC_PATH)
 
 
 # ## 5 — Resolve
@@ -112,20 +110,22 @@ job = load_job(JOB_SPEC_PATH or JOB_SPEC_URL or HF_JOB_SPEC or JOB_SPEC)
 # In[ ]:
 
 
-execution = prepare_execution(job, platform=runtime, hardware=hardware, planning_only=True)
-print(json.dumps(execution.dry_run(), indent=2))
+execution = prepare_execution(job, platform=runtime, hardware=hardware, planning_only=True, repo_root=ROOT)
+execution.show_preflight(publish=PUBLISH_ARTIFACTS)
 
 
 # ## 6 — Dry run
-# Install only the selected engine. Offline config validation downloads no model weights. The execution cell runs Soup doctor and its data preflight before real training. Restart the kernel if installation changes frameworks already imported in this runtime.
+# Install only the selected engine. Offline config validation downloads no model weights. When training is enabled, this cell runs Soup doctor and data preflight before the execution cell. Full logs and exact commands are saved under the run root. Restart the kernel if installation changes frameworks already imported in this runtime.
 
 # In[ ]:
 
 
 bootstrap(job, training=RUN_TRAINING)
+verify_engine_environment(job)
 hardware = probe_hardware(runtime)
-execution = prepare_execution(job, platform=runtime, hardware=hardware, planning_only=not RUN_TRAINING)
-print(json.dumps(execution.dry_run(), indent=2))
+execution = prepare_execution(job, platform=runtime, hardware=hardware, planning_only=not RUN_TRAINING, repo_root=ROOT)
+execution.show_preflight(publish=PUBLISH_ARTIFACTS)
+execution.validate()
 
 
 # ## 7 — Execute
@@ -150,4 +150,13 @@ else:
 
 
 print(json.dumps(result, indent=2))
+
+
+# ## Diagnostics
+# Run this cell after a failure to inspect status, resolved paths, environment, config, last command, log tail and checkpoints.
+
+# In[ ]:
+
+
+execution.show_diagnostics()
 

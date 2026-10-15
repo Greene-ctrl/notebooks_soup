@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import sysconfig
+from pathlib import Path
 import importlib.metadata
 from .job import JobSpec, PromptJobSpec, HFDatasetSpec
 
@@ -91,3 +93,26 @@ def bootstrap(job: JobSpec, *, training: bool = False) -> None:
         subprocess.run(command, check=True)
     if any(importlib.metadata.version(name) != version for name, version in loaded.items()):
         raise RuntimeError("Training dependencies changed already-imported frameworks; restart the notebook kernel and rerun the cells")
+
+
+def soup_executable() -> Path:
+    """The kernel's install scripts directory (may differ from python's bin)."""
+    return Path(sysconfig.get_path("scripts")) / "soup"
+
+
+def verify_engine_environment(job: JobSpec) -> None:
+    """Verify the selected CLI belongs to this kernel, not a preinstalled PATH entry."""
+    import shutil
+    engine = selected_bootstrap_engine(job)
+    print("Python executable:", sys.executable)
+    print("Python version:", sys.version.split()[0])
+    if engine == "soup":
+        executable = shutil.which("soup")
+        expected = soup_executable()
+        if not executable or Path(executable).resolve() != expected.resolve():
+            raise RuntimeError(f"Soup executable must come from the kernel environment: {expected}")
+        if importlib.metadata.version("soup-cli") != SOUP_VERSION:
+            raise RuntimeError(f"Expected Soup {SOUP_VERSION}")
+        print("Soup executable:", executable)
+        # Soup 0.76.0 has no --version option; distribution metadata is canonical.
+        print("Soup version:", importlib.metadata.version("soup-cli"))

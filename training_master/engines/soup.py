@@ -2,26 +2,34 @@
 from __future__ import annotations
 
 import importlib.metadata
+import hashlib
 import shutil
-import subprocess
 from pathlib import Path
 
 import yaml
 
 from ..artifacts import RunPaths
-from ..bootstrap import SOUP_VERSION
+from ..bootstrap import SOUP_VERSION, soup_executable
 from ..checkpoint import IncompleteCheckpoint, MANIFEST
 from ..hardware import HardwareProfile
 from ..job import JobSpec
+from ..process import run_process
+from ..paths import REPO_ROOT, resolve_job_paths
 from .base import TrainingEngine, UnsupportedJob, materialize_dataset
 
 
 class SoupEngine(TrainingEngine):
     name = "soup"
 
+    def __init__(self, *, tail_lines: int = 100):
+        self.tail_lines = tail_lines
+
     def available(self) -> bool:
         try:
-            return bool(shutil.which("soup")) and importlib.metadata.version("soup-cli") == SOUP_VERSION
+            executable = shutil.which("soup")
+            expected = soup_executable()
+            return (bool(executable) and Path(executable).resolve() == expected.resolve()
+                    and importlib.metadata.version("soup-cli") == SOUP_VERSION)
         except importlib.metadata.PackageNotFoundError:
             return False
 
@@ -50,6 +58,7 @@ class SoupEngine(TrainingEngine):
         return {
             "base": job.model.id, "task": job.task.type, "backend": job.engine.backend or "transformers",
             "data": {"train": str(dataset_path or paths.root / "data.jsonl"), "format": job.dataset.format, "max_length": t.max_length, "val_split": 0.0},
+            # Soup defaults to 4bit: write "none" explicitly when unquantized.
             "training": {
                 "epochs": t.epochs, "lr": t.learning_rate, "batch_size": t.batch_size,
                 "gradient_accumulation_steps": t.gradient_accumulation_steps,
@@ -67,34 +76,61 @@ class SoupEngine(TrainingEngine):
         paths = paths or RunPaths.for_job(job)
         paths.create()
         config_path = paths.root / "soup.yaml"
+        job = resolve_job_paths(job, REPO_ROOT)
         config_path.write_text(yaml.safe_dump(self.config(job, paths), sort_keys=False), encoding="utf-8")
         return {"engine": self.name, "config_path": str(config_path)}
 
     def dry_run(self, job: JobSpec, hardware: HardwareProfile, paths: RunPaths | None = None, *, cli: bool = False) -> dict:
-        plan = self.prepare(job, hardware, paths)
-        plan.update(valid=True, weights_downloaded=False, cli_preflight=False)
+        self.validate(job, hardware)
+        paths = paths or RunPaths.for_job(job)
+        if not (paths.root / "soup.yaml").exists():
+            self.prepare(job, hardware, paths)
+        plan = {"engine": self.name, "config_path": str(paths.root / "soup.yaml"),
+                "valid": True, "weights_downloaded": False, "cli_preflight": False}
         if cli:
             if not self.available():
-                raise RuntimeError("Install the pinned Soup CLI and selected training extra first")
-            paths = paths or RunPaths.for_job(job)
-            # --dry-run validates data; it may fetch a small dataset/model config,
-            # but does not instantiate/download model weights. doctor alone is not
-            # sufficient: its unsupported-setting reports are partly advisory.
-            materialize_dataset(job, paths)
-            self._command(["doctor", "--config", plan["config_path"]], paths)
-            self._command(["train", "--config", plan["config_path"], "--dry-run"], paths)
+                raise RuntimeError("Install the pinned Soup CLI in the kernel environment and selected training extra first")
+            self._validated_config = None
+            # Use the same materialized data and config for preflight and train.
+            materialize_dataset(resolve_job_paths(job, REPO_ROOT), paths)
+            self._command(["doctor", "--config", plan["config_path"]], paths, name="soup-doctor")
+            self._command(["train", "--config", plan["config_path"], "--dry-run"], paths, name="soup-dry-run")
+            self._validated_config = self._fingerprint(paths)
             plan["cli_preflight"] = True
         return plan
 
-    def _command(self, args: list[str], paths: RunPaths) -> None:
-        with (paths.root / "logs" / "soup.log").open("a", encoding="utf-8") as log:
-            subprocess.run(["soup", *args], cwd=paths.root.parent.parent, stdout=log, stderr=subprocess.STDOUT, check=True)
+    def _fingerprint(self, paths: RunPaths):
+        digest = hashlib.sha256()
+        for path in (paths.root / "soup.yaml", paths.root / "data.jsonl"):
+            if not path.exists():
+                return None
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        return digest.hexdigest()
+
+    def _command(self, args: list[str], paths: RunPaths, *, name: str, on_poll=None):
+        # Keep every invocation, including retries, while the first uses the
+        # simple documented filename. Diagnostics select the newest record.
+        stem = name
+        index = 1
+        while (paths.root / "commands" / f"{stem}.json").exists():
+            stem = f"{name}-{index:03d}"
+            index += 1
+        return run_process([str(soup_executable()), *args], cwd=paths.root,
+                           log_path=paths.root / "logs" / f"{stem}.log",
+                           record_path=paths.root / "commands" / f"{stem}.json", on_poll=on_poll, tail_lines=self.tail_lines)
 
     def run(self, job: JobSpec, hardware: HardwareProfile, paths: RunPaths, *, resume: Path | None = None, on_checkpoint=None) -> dict:
-        self.dry_run(job, hardware, paths, cli=True)
-        command = ["soup", "train", "--config", str(paths.root / "soup.yaml"), "--yes"]
+        # Direct engine callers also receive mandatory preflight. Execution
+        # supplies an already validated config and marks that specific snapshot.
+        self.validate(job, hardware)
+        fingerprint = self._fingerprint(paths)
+        if fingerprint is None or getattr(self, "_validated_config", None) != fingerprint:
+            self.dry_run(job, hardware, paths, cli=True)
+        command = ["train", "--config", str(paths.root / "soup.yaml"), "--yes"]
         if resume:
-            command += ["--resume", str(resume)]
+            command += ["--resume", str(resume.resolve())]
         # Never relabel or publish checkpoints from before this subprocess run.
         seen = {path for path in paths.trainer.glob("checkpoint-*") if (path / MANIFEST).is_file()}
 
@@ -111,26 +147,8 @@ class SoupEngine(TrainingEngine):
                             continue
                         seen.add(path)
 
-        with (paths.root / "logs" / "soup.log").open("a", encoding="utf-8") as log:
-            process = subprocess.Popen(command, cwd=paths.root.parent.parent, stdout=log, stderr=subprocess.STDOUT)
-            try:
-                while True:
-                    try:
-                        code = process.wait(timeout=2)
-                        break
-                    except subprocess.TimeoutExpired:
-                        scan()
-                scan()
-                if code:
-                    raise subprocess.CalledProcessError(code, command)
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+        self._command(command, paths, name="soup-train", on_poll=scan)
+        scan()
         # Soup saves the final adapter alongside its Trainer checkpoints.
         for file in paths.trainer.iterdir():
             if file.is_file() and file.name != MANIFEST:

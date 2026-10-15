@@ -2,11 +2,10 @@ version: 1
 run_id: tiny-soup-sft-001
 model:
   id: HuggingFaceTB/SmolLM2-135M
-# Public text dataset, streamed and capped; at most 8 optimizer steps in one
+# Bundled synthetic text fixture; at most 8 optimizer steps in one
 # epoch with batch size 1 and accumulation 1. Soup has no max_steps setting.
 dataset:
-  source: Salesforce/wikitext
-  config: wikitext-2-raw-v1
+  source: examples/data/plaintext_tiny.jsonl
   split: train
   format: plaintext
   limit: 8
